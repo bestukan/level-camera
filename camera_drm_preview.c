@@ -592,7 +592,9 @@ static int drm_set_plane(drm_preview_t *drm,
 static int drm_try_show_on_plane(drm_preview_t *drm,
                                  const camera_v4l2_frame_t *frame,
                                  uint32_t plane_id,
-                                 uint32_t fb_id)
+                                 uint32_t fb_id,
+                                 char *errbuf,
+                                 size_t errbuf_sz)
 {
     int ret;
 
@@ -671,30 +673,35 @@ static int drm_try_show_on_plane(drm_preview_t *drm,
             return 0;
         }
 
-        fprintf(stderr,
-                "drmModeSetPlane failed: fullscreen errno=%s, "
-                "center/top-left errno=%s, fb=%u plane=%u crtc=%u "
-                "dst=%ux%u src=%ux%u crop=(%u,%u %ux%u)\n",
-                strerror(scale_errno),
-                strerror(errno),
-                fb_id,
-                plane_id,
-                drm->crtc_id,
-                drm->mode.hdisplay,
-                drm->mode.vdisplay,
-                frame->width,
-                frame->height,
-                src_x,
-                src_y,
-                dst_w,
-                dst_h);
+        if (errbuf && errbuf_sz > 0) {
+            snprintf(errbuf,
+                     errbuf_sz,
+                     "plane=%u fullscreen=%s center/top-left=%s "
+                     "fb=%u crtc=%u dst=%ux%u src=%ux%u crop=(%u,%u %ux%u)",
+                     plane_id,
+                     strerror(scale_errno),
+                     strerror(errno),
+                     fb_id,
+                     drm->crtc_id,
+                     drm->mode.hdisplay,
+                     drm->mode.vdisplay,
+                     frame->width,
+                     frame->height,
+                     src_x,
+                     src_y,
+                     dst_w,
+                     dst_h);
+        }
     } else {
-        fprintf(stderr,
-                "drmModeSetPlane fullscreen failed: %s, fb=%u plane=%u crtc=%u\n",
-                strerror(errno),
-                fb_id,
-                plane_id,
-                drm->crtc_id);
+        if (errbuf && errbuf_sz > 0) {
+            snprintf(errbuf,
+                     errbuf_sz,
+                     "plane=%u fullscreen=%s fb=%u crtc=%u",
+                     plane_id,
+                     strerror(errno),
+                     fb_id,
+                     drm->crtc_id);
+        }
     }
 
     return ret;
@@ -706,16 +713,44 @@ static int drm_preview_show(drm_preview_t *drm,
     uint32_t fb_id;
     unsigned int i;
     int ret = -1;
+    char last_error[256];
+
+    last_error[0] = '\0';
 
     if (frame_to_drm_fb(drm, frame, &fb_id) < 0)
         return -1;
 
     for (i = 0; i < drm->plane_count; i++) {
         drm->plane_id = drm->plane_ids[i];
-        ret = drm_try_show_on_plane(drm, frame, drm->plane_id, fb_id);
-        if (ret == 0)
+        ret = drm_try_show_on_plane(drm,
+                                    frame,
+                                    drm->plane_id,
+                                    fb_id,
+                                    last_error,
+                                    sizeof(last_error));
+        if (ret == 0) {
+            static int printed_plane;
+
+            if (i != 0) {
+                uint32_t good_plane = drm->plane_ids[i];
+
+                memmove(&drm->plane_ids[1],
+                        &drm->plane_ids[0],
+                        i * sizeof(drm->plane_ids[0]));
+                drm->plane_ids[0] = good_plane;
+            }
+
+            if (!printed_plane) {
+                printf("DRM display using plane=%u\n", drm->plane_id);
+                fflush(stdout);
+                printed_plane = 1;
+            }
             return 0;
+        }
     }
+
+    if (last_error[0])
+        fprintf(stderr, "drmModeSetPlane failed: %s\n", last_error);
 
     return ret;
 }
@@ -807,6 +842,13 @@ int main(int argc, char **argv)
 
         if (frame_count == 0) {
             unsigned int p;
+
+            printf("first frame: index=%u sequence=%u ts_ns=%lld "
+                   "timestamp_flags=0x%x\n",
+                   cur.index,
+                   cur.sequence,
+                   (long long)cur.ts_ns,
+                   cur.timestamp_flags);
 
             for (p = 0; p < cur.plane_count; p++) {
                 printf("first frame plane[%u]: dmabuf_fd=%d bytesused=%u "
