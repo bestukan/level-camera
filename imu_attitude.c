@@ -1,57 +1,15 @@
-// icm42688_attitude.c
+#define _GNU_SOURCE
+
+#include "imu_attitude.h"
+
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
 #include <unistd.h>
 
-#define DEG(x) ((x) * 180.0 / M_PI)
-#define RAD(x) ((x) * M_PI / 180.0)
-#define ATTITUDE_RING_SIZE 512
-
-typedef struct {
-    double roll;
-    double pitch;
-    double yaw;
-} euler_t;
-
-typedef struct {
-    char accel_path[256];
-    char gyro_path[256];
-    double gyro_bias_x;
-    double gyro_bias_y;
-    double gyro_bias_z;
-} imu_t;
-
-typedef struct {
-    int64_t ts_ns;
-    double ax, ay, az;
-    double gx, gy, gz;
-} imu_sample_t;
-
-typedef struct {
-    int64_t ts_ns;
-    double roll;
-    double pitch;
-    double yaw;
-    double level_angle;
-} attitude_sample_t;
-
-typedef struct {
-    euler_t e;
-    double level_angle_filt;
-    int initialized;
-} attitude_filter_t;
-
-typedef struct {
-    attitude_sample_t samples[ATTITUDE_RING_SIZE];
-    unsigned int head;
-    unsigned int count;
-} attitude_ring_t;
-
-static int64_t now_ns(void)
+int64_t imu_now_ns(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -152,6 +110,9 @@ static int calibrate_gyro(imu_t *imu, int samples)
     double sy = 0.0;
     double sz = 0.0;
 
+    if (samples <= 0)
+        return 0;
+
     printf("Keep IMU still, calibrating gyro...\n");
 
     for (int i = 0; i < samples; i++) {
@@ -193,8 +154,85 @@ static double interp_angle(double a, double b, double ratio)
     return wrap_pi(a + wrap_pi(b - a) * ratio);
 }
 
-static void attitude_ring_push(attitude_ring_t *ring, const attitude_sample_t *sample)
+int imu_init_with_names(imu_t *imu,
+                        const char *accel_name,
+                        const char *gyro_name,
+                        int gyro_calib_samples)
 {
+    if (!imu || !accel_name || !gyro_name)
+        return -1;
+
+    memset(imu, 0, sizeof(*imu));
+
+    if (find_iio_device(accel_name,
+                        imu->accel_path,
+                        sizeof(imu->accel_path)) < 0) {
+        fprintf(stderr, "Cannot find IIO device: %s\n", accel_name);
+        return -1;
+    }
+
+    if (find_iio_device(gyro_name,
+                        imu->gyro_path,
+                        sizeof(imu->gyro_path)) < 0) {
+        fprintf(stderr, "Cannot find IIO device: %s\n", gyro_name);
+        return -1;
+    }
+
+    printf("accel: %s\n", imu->accel_path);
+    printf("gyro : %s\n", imu->gyro_path);
+
+    if (calibrate_gyro(imu, gyro_calib_samples) < 0) {
+        fprintf(stderr, "Gyro calibration failed\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+int imu_init(imu_t *imu)
+{
+    return imu_init_with_names(imu, "icm42688-accel", "icm42688-gyro", 200);
+}
+
+int imu_read_sample(const imu_t *imu, imu_sample_t *sample)
+{
+    if (!imu || !sample)
+        return -1;
+
+    memset(sample, 0, sizeof(*sample));
+    sample->ts_ns = imu_now_ns();
+
+    if (read_accel(imu, &sample->ax, &sample->ay, &sample->az) < 0) {
+        fprintf(stderr, "accel: %s\n", imu->accel_path);
+        return -1;
+    }
+
+    if (read_gyro(imu, &sample->gx, &sample->gy, &sample->gz) < 0) {
+        fprintf(stderr, "gyro : %s\n", imu->gyro_path);
+        return -1;
+    }
+
+    return 0;
+}
+
+void attitude_filter_init(attitude_filter_t *filter)
+{
+    if (filter)
+        memset(filter, 0, sizeof(*filter));
+}
+
+void attitude_ring_init(attitude_ring_t *ring)
+{
+    if (ring)
+        memset(ring, 0, sizeof(*ring));
+}
+
+void attitude_ring_push(attitude_ring_t *ring,
+                        const attitude_sample_t *sample)
+{
+    if (!ring || !sample)
+        return;
+
     ring->samples[ring->head] = *sample;
     ring->head = (ring->head + 1) % ATTITUDE_RING_SIZE;
 
@@ -217,14 +255,14 @@ static int attitude_ring_get(const attitude_ring_t *ring,
     return 0;
 }
 
-static int attitude_ring_query(const attitude_ring_t *ring,
-                               int64_t ts_ns,
-                               attitude_sample_t *out)
+int attitude_ring_query(const attitude_ring_t *ring,
+                        int64_t ts_ns,
+                        attitude_sample_t *out)
 {
     attitude_sample_t older;
     attitude_sample_t newer;
 
-    if (ring->count == 0)
+    if (!ring || !out || ring->count == 0)
         return -1;
 
     if (attitude_ring_get(ring, 0, &newer) < 0)
@@ -258,17 +296,29 @@ static int attitude_ring_query(const attitude_ring_t *ring,
     return 0;
 }
 
-static void attitude_update(attitude_filter_t *f,
-                            const imu_sample_t *s,
-                            double dt,
-                            attitude_sample_t *out)
+void attitude_update(attitude_filter_t *f,
+                     const imu_sample_t *s,
+                     double dt,
+                     attitude_sample_t *out)
 {
     const double tau = 0.5;
-    double alpha = tau / (tau + dt);
+    double alpha;
 
-    double ax = s->ax;
-    double ay = s->ay;
-    double az = s->az;
+    double ax;
+    double ay;
+    double az;
+
+    if (!f || !s || !out)
+        return;
+
+    if (dt <= 0.0 || dt > 0.2)
+        dt = 0.01;
+
+    alpha = tau / (tau + dt);
+
+    ax = s->ax;
+    ay = s->ay;
+    az = s->az;
 
     double acc_norm = sqrt(ax * ax + ay * ay + az * az);
     int accel_valid = acc_norm > 0.7 * 9.80665 && acc_norm < 1.3 * 9.80665;
@@ -291,8 +341,8 @@ static void attitude_update(attitude_filter_t *f,
         f->level_angle_filt = level_angle;
         f->initialized = 1;
     } else {
-        double smooth = 0.15;
-        f->level_angle_filt = lowpass_angle(f->level_angle_filt, level_angle, smooth);
+        // double smooth = 0.15;
+        // f->level_angle_filt = lowpass_angle(f->level_angle_filt, level_angle, smooth);
     }
 
     out->ts_ns = s->ts_ns;
@@ -300,77 +350,4 @@ static void attitude_update(attitude_filter_t *f,
     out->pitch = f->e.pitch;
     out->yaw = f->e.yaw;
     out->level_angle = f->level_angle_filt;
-}
-
-int main(void)
-{
-    imu_t imu;
-    memset(&imu, 0, sizeof(imu));
-
-    if (find_iio_device("icm42688-accel", imu.accel_path, sizeof(imu.accel_path)) < 0) {
-        fprintf(stderr, "Cannot find IIO device: icm42688-accel\n");
-        return 1;
-    }
-
-    if (find_iio_device("icm42688-gyro", imu.gyro_path, sizeof(imu.gyro_path)) < 0) {
-        fprintf(stderr, "Cannot find IIO device: icm42688-gyro\n");
-        return 1;
-    }
-
-    printf("accel: %s\n", imu.accel_path);
-    printf("gyro : %s\n", imu.gyro_path);
-
-    if (calibrate_gyro(&imu, 200) < 0) {
-        fprintf(stderr, "Gyro calibration failed\n");
-        return 1;
-    }
-
-    attitude_filter_t filter;
-    attitude_ring_t ring;
-    memset(&filter, 0, sizeof(filter));
-    memset(&ring, 0, sizeof(ring));
-
-    int64_t last_ns = now_ns();
-
-    while (1) {
-        imu_sample_t sample;
-        attitude_sample_t attitude;
-
-        sample.ts_ns = now_ns();
-
-        int64_t dt_ns = sample.ts_ns - last_ns;
-        last_ns = sample.ts_ns;
-
-        double dt = dt_ns / 1000000000.0;
-        if (dt <= 0.0 || dt > 0.2)
-            dt = 0.01;
-
-        if (read_accel(&imu, &sample.ax, &sample.ay, &sample.az) < 0) {
-            fprintf(stderr, "accel: %s\n", imu.accel_path);
-            return 1;
-        }
-
-        if (read_gyro(&imu, &sample.gx, &sample.gy, &sample.gz) < 0) {
-            fprintf(stderr, "gyro : %s\n", imu.gyro_path);
-            return 1;
-        }
-
-        attitude_update(&filter, &sample, dt, &attitude);
-        attitude_ring_push(&ring, &attitude);
-
-        if (attitude_ring_query(&ring, attitude.ts_ns, &attitude) < 0)
-            continue;
-
-        printf("%lld,%.3f,%.3f,%.3f,%.3f\n",
-            (long long)attitude.ts_ns,
-            DEG(attitude.roll),
-            DEG(attitude.pitch),
-            DEG(attitude.yaw),
-            DEG(attitude.level_angle));
-        fflush(stdout);
-
-        usleep(10000);
-    }
-
-    return 0;
 }
