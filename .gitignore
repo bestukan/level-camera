@@ -1,2 +1,5 @@
+build/
 camera_dump_test
 camera_drm_preview
+egl_gbm_probe
+imu_attitude_test
